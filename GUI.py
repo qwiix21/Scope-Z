@@ -6,16 +6,19 @@ from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, 
                                 QHBoxLayout, QSpinBox, QDoubleSpinBox, QSlider, QCheckBox, 
                                 QGroupBox, QColorDialog, QSystemTrayIcon, QMenu, QComboBox)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QAction, QIcon, QPixmap
 
 class KeyButton(QPushButton):
     def __init__(self, parent=None):
         super().__init__("Click to set", parent)
         self.key_code = 0x05
+        self.modifiers = {'ctrl': False, 'shift': False, 'alt': False}
         self.key_name = "Mouse 4"
         self.setText(self.key_name)
         self.recording = False
+        self.temp_key_code = None
+        self.temp_modifiers = {'ctrl': False, 'shift': False, 'alt': False}
         
     def get_key_name(self, vk_code):
         key_names = {
@@ -26,14 +29,23 @@ class KeyButton(QPushButton):
             0x2C: "Print Screen", 0x2D: "Insert", 0x2E: "Delete",
             0x5B: "Win", 0x5D: "Menu", 0x70: "F1", 0x71: "F2", 0x72: "F3", 0x73: "F4",
             0x74: "F5", 0x75: "F6", 0x76: "F7", 0x77: "F8", 0x78: "F9", 0x79: "F10",
-            0x7A: "F11", 0x7B: "F12", 0x90: "Num Lock", 0x91: "Scroll Lock"
+            0x7A: "F11", 0x7B: "F12", 0x90: "Num Lock", 0x91: "Scroll Lock",
+            0x200: "Wheel Up", 0x201: "Wheel Down"
         }
         return key_names.get(vk_code, chr(vk_code) if 0x30 <= vk_code <= 0x5A else f"Key {vk_code}")
+    
+    def get_display_name(self):
+        parts = []
+        if self.modifiers['ctrl']: parts.append('Ctrl')
+        if self.modifiers['shift']: parts.append('Shift')
+        if self.modifiers['alt']: parts.append('Alt')
+        parts.append(self.key_name)
+        return '+'.join(parts)
         
     def mousePressEvent(self, event):
         if not self.recording:
             self.recording = True
-            self.setText("Press any key...")
+            self.setText("Press key combination...")
             self.grabKeyboard()
             self.grabMouse()
         else:
@@ -47,19 +59,51 @@ class KeyButton(QPushButton):
             }
             if btn in mouse_map:
                 self.key_code, self.key_name = mouse_map[btn]
-                self.setText(self.key_name)
+                self.modifiers = {'ctrl': False, 'shift': False, 'alt': False}
+                self.setText(self.get_display_name())
                 self.recording = False
                 self.releaseKeyboard()
                 self.releaseMouse()
-        
-    def keyPressEvent(self, event):
+                
+    def wheelEvent(self, event):
         if self.recording:
-            self.key_code = event.nativeVirtualKey()
-            self.key_name = self.get_key_name(self.key_code)
-            self.setText(self.key_name)
+            if event.angleDelta().y() > 0:
+                self.key_code, self.key_name = (0x200, "Wheel Up")
+            else:
+                self.key_code, self.key_name = (0x201, "Wheel Down")
+            
+            self.modifiers['ctrl'] = bool(event.modifiers() & Qt.ControlModifier)
+            self.modifiers['shift'] = bool(event.modifiers() & Qt.ShiftModifier)
+            self.modifiers['alt'] = bool(event.modifiers() & Qt.AltModifier)
+            
+            self.setText(self.get_display_name())
             self.recording = False
             self.releaseKeyboard()
             self.releaseMouse()
+        
+    def keyPressEvent(self, event):
+        if self.recording:
+            if event.key() in [Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta]:
+                return
+            
+            self.temp_key_code = event.nativeVirtualKey()
+            self.temp_modifiers['ctrl'] = bool(event.modifiers() & Qt.ControlModifier)
+            self.temp_modifiers['shift'] = bool(event.modifiers() & Qt.ShiftModifier)
+            self.temp_modifiers['alt'] = bool(event.modifiers() & Qt.AltModifier)
+            
+    def keyReleaseEvent(self, event):
+        if self.recording and self.temp_key_code is not None:
+            self.key_code = self.temp_key_code
+            self.key_name = self.get_key_name(self.key_code)
+            self.modifiers = self.temp_modifiers.copy()
+            
+            self.setText(self.get_display_name())
+            self.recording = False
+            self.releaseKeyboard()
+            self.releaseMouse()
+            
+            self.temp_key_code = None
+            self.temp_modifiers = {'ctrl': False, 'shift': False, 'alt': False}
 
 class ScopeZGUI(QWidget):
     def __init__(self):
@@ -71,6 +115,7 @@ class ScopeZGUI(QWidget):
         self.load_config()
         self.initUI()
         self.setup_tray()
+        self.setup_zoom_sync()
         
     def load_config(self):
         if self.config_file.exists():
@@ -79,14 +124,22 @@ class ScopeZGUI(QWidget):
                 self.lens_size = cfg.get("lens_size", 300)
                 self.zoom_factor = cfg.get("zoom_factor", 3.0)
                 self.toggle_key = cfg.get("toggle_key", 0x05)
-                self.exit_key = cfg.get("exit_key", 0x23)
+                self.toggle_modifiers = cfg.get("toggle_modifiers", {'ctrl': False, 'shift': False, 'alt': False})
+                self.zoom_in_key = cfg.get("zoom_in_key", 0x200)
+                self.zoom_in_modifiers = cfg.get("zoom_in_modifiers", {'ctrl': True, 'shift': False, 'alt': False})
+                self.zoom_out_key = cfg.get("zoom_out_key", 0x201)
+                self.zoom_out_modifiers = cfg.get("zoom_out_modifiers", {'ctrl': True, 'shift': False, 'alt': False})
                 self.lens_shape = cfg.get("lens_shape", 0)
                 self.fps = cfg.get("fps", 60)
         else:
             self.lens_size = 300
             self.zoom_factor = 3.0
             self.toggle_key = 0x05
-            self.exit_key = 0x23
+            self.toggle_modifiers = {'ctrl': False, 'shift': False, 'alt': False}
+            self.zoom_in_key = 0x200
+            self.zoom_in_modifiers = {'ctrl': True, 'shift': False, 'alt': False}
+            self.zoom_out_key = 0x201
+            self.zoom_out_modifiers = {'ctrl': True, 'shift': False, 'alt': False}
             self.lens_shape = 0
             self.fps = 60
             
@@ -96,7 +149,11 @@ class ScopeZGUI(QWidget):
                 "lens_size": self.lens_input.value(),
                 "zoom_factor": self.zoom_input.value(),
                 "toggle_key": self.toggle_btn.key_code,
-                "exit_key": self.exit_btn.key_code,
+                "toggle_modifiers": self.toggle_btn.modifiers,
+                "zoom_in_key": self.zoom_in_btn.key_code,
+                "zoom_in_modifiers": self.zoom_in_btn.modifiers,
+                "zoom_out_key": self.zoom_out_btn.key_code,
+                "zoom_out_modifiers": self.zoom_out_btn.modifiers,
                 "lens_shape": self.shape_combo.currentIndex(),
                 "fps": self.fps_values[self.fps_slider.value()]
             }
@@ -107,8 +164,18 @@ class ScopeZGUI(QWidget):
         
     def initUI(self):
         self.setWindowTitle('Scope Z')
-        icon_path = self.script_dir / 'Scope Z ico.png'
-        self.setWindowIcon(QIcon(str(icon_path)))
+        icon_paths = [
+            self.script_dir / 'Scope Z ico.png',
+            Path(sys.executable).parent / 'Scope Z ico.png',
+            Path('./Scope Z ico.png')
+        ]
+        icon_path = None
+        for path in icon_paths:
+            if path.exists():
+                icon_path = path
+                break
+        if icon_path:
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setFixedSize(400, 520)
         self.setStyleSheet("""
@@ -342,20 +409,36 @@ class ScopeZGUI(QWidget):
         self.toggle_btn = KeyButton()
         self.toggle_btn.key_code = self.toggle_key
         self.toggle_btn.key_name = self.toggle_btn.get_key_name(self.toggle_key)
-        self.toggle_btn.setText(self.toggle_btn.key_name)
-        self.toggle_btn.setFixedSize(90, 30)
+        if hasattr(self, 'toggle_modifiers'):
+            self.toggle_btn.modifiers = self.toggle_modifiers
+        self.toggle_btn.setText(self.toggle_btn.get_display_name())
+        self.toggle_btn.setFixedSize(120, 30)
         toggle_layout.addWidget(self.toggle_btn)
         hotkeys_layout.addLayout(toggle_layout)
         
-        exit_layout = QHBoxLayout()
-        exit_layout.addWidget(QLabel('Exit Key:'))
-        self.exit_btn = KeyButton()
-        self.exit_btn.key_code = self.exit_key
-        self.exit_btn.key_name = self.exit_btn.get_key_name(self.exit_key)
-        self.exit_btn.setText(self.exit_btn.key_name)
-        self.exit_btn.setFixedSize(90, 30)
-        exit_layout.addWidget(self.exit_btn)
-        hotkeys_layout.addLayout(exit_layout)
+        zoom_in_layout = QHBoxLayout()
+        zoom_in_layout.addWidget(QLabel('Zoom In:'))
+        self.zoom_in_btn = KeyButton()
+        self.zoom_in_btn.key_code = self.zoom_in_key
+        self.zoom_in_btn.key_name = self.zoom_in_btn.get_key_name(self.zoom_in_key)
+        if hasattr(self, 'zoom_in_modifiers'):
+            self.zoom_in_btn.modifiers = self.zoom_in_modifiers
+        self.zoom_in_btn.setText(self.zoom_in_btn.get_display_name())
+        self.zoom_in_btn.setFixedSize(120, 30)
+        zoom_in_layout.addWidget(self.zoom_in_btn)
+        hotkeys_layout.addLayout(zoom_in_layout)
+        
+        zoom_out_layout = QHBoxLayout()
+        zoom_out_layout.addWidget(QLabel('Zoom Out:'))
+        self.zoom_out_btn = KeyButton()
+        self.zoom_out_btn.key_code = self.zoom_out_key
+        self.zoom_out_btn.key_name = self.zoom_out_btn.get_key_name(self.zoom_out_key)
+        if hasattr(self, 'zoom_out_modifiers'):
+            self.zoom_out_btn.modifiers = self.zoom_out_modifiers
+        self.zoom_out_btn.setText(self.zoom_out_btn.get_display_name())
+        self.zoom_out_btn.setFixedSize(120, 30)
+        zoom_out_layout.addWidget(self.zoom_out_btn)
+        hotkeys_layout.addLayout(zoom_out_layout)
         
         hotkeys_group.setLayout(hotkeys_layout)
         content_layout.addWidget(hotkeys_group)
@@ -410,13 +493,22 @@ class ScopeZGUI(QWidget):
             try:
                 self.save_config()
                 self.dll = ctypes.CDLL(str(self.script_dir / 'scope_z.dll'))
-                self.dll.StartMagnifier.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                self.dll.StartMagnifier.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
                 self.dll.UpdateSettings.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                self.dll.GetCurrentZoom.argtypes = []
+                self.dll.GetCurrentZoom.restype = ctypes.c_float
                 self.dll.StartMagnifier(
                     self.lens_input.value(),
                     ctypes.c_float(self.zoom_input.value()),
                     self.toggle_btn.key_code,
-                    self.exit_btn.key_code,
+                    self.zoom_in_btn.key_code,
+                    1 if self.zoom_in_btn.modifiers['ctrl'] else 0,
+                    1 if self.zoom_in_btn.modifiers['shift'] else 0,
+                    1 if self.zoom_in_btn.modifiers['alt'] else 0,
+                    self.zoom_out_btn.key_code,
+                    1 if self.zoom_out_btn.modifiers['ctrl'] else 0,
+                    1 if self.zoom_out_btn.modifiers['shift'] else 0,
+                    1 if self.zoom_out_btn.modifiers['alt'] else 0,
                     self.shape_combo.currentIndex(),
                     0,
                     0,
@@ -430,6 +522,7 @@ class ScopeZGUI(QWidget):
                 self.launch_btn.setStyleSheet("background: #d32f2f;")
                 self.status.setText('● Running')
                 self.status.setStyleSheet("color: #4caf50; font-size: 11pt;")
+                self.zoom_timer.start()
             except Exception as e:
                 self.status.setText(f'✖ {str(e)}')
                 self.status.setStyleSheet("color: #f44336; font-size: 9pt;")
@@ -441,10 +534,26 @@ class ScopeZGUI(QWidget):
             self.launch_btn.setStyleSheet("")
             self.status.setText('● Stopped')
             self.status.setStyleSheet("color: #ff9800; font-size: 11pt;")
+            self.zoom_timer.stop()
             
     def setup_tray(self):
-        icon_path = self.script_dir / 'Scope Z ico.png'
-        self.tray = QSystemTrayIcon(QIcon(str(icon_path)), self)
+        icon_paths = [
+            self.script_dir / 'Scope Z ico.png',
+            Path(sys.executable).parent / 'Scope Z ico.png',
+            Path('./Scope Z ico.png')
+        ]
+        icon_path = None
+        for path in icon_paths:
+            if path.exists():
+                icon_path = path
+                break
+        
+        if icon_path:
+            self.tray = QSystemTrayIcon(QIcon(str(icon_path)), self)
+        else:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(QColor('#0d7377'))
+            self.tray = QSystemTrayIcon(QIcon(pixmap), self)
         menu = QMenu()
         show_action = QAction('Show', self)
         show_action.triggered.connect(self.show)
@@ -465,7 +574,25 @@ class ScopeZGUI(QWidget):
             self.dll.StopMagnifier()
         QApplication.quit()
         
+    def setup_zoom_sync(self):
+        self.zoom_timer = QTimer()
+        self.zoom_timer.timeout.connect(self.sync_zoom)
+        self.zoom_timer.setInterval(50)
+        
+    def sync_zoom(self):
+        if self.running and self.dll:
+            try:
+                current_zoom = self.dll.GetCurrentZoom()
+                if abs(current_zoom - self.zoom_input.value()) > 0.01:
+                    self.zoom_input.blockSignals(True)
+                    self.zoom_input.setValue(current_zoom)
+                    self.zoom_input.blockSignals(False)
+            except:
+                pass
+                
     def closeEvent(self, event):
+        if hasattr(self, 'zoom_timer'):
+            self.zoom_timer.stop()
         event.ignore()
         self.hide()
 
@@ -473,4 +600,4 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     gui = ScopeZGUI()
     gui.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec()) 
